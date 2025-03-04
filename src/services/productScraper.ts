@@ -34,9 +34,8 @@ import { fetchWithCorsProxy } from "./corsProxyService";
 // Function to fetch products from the API or database
 export const fetchProducts = async (): Promise<Product[]> => {
   try {
-    // URL for phones and GPS navigation in outlet condition
-    const url =
-      "https://www.oleole.pl/search/telefony-i-nawigacja-gps,stan-outlet-doskonaly:outlet-dobry:outlet-dostateczny,d10.bhtml?keyword=outlet&searchType=tag";
+    // URL for all outlet products
+    const url = "https://www.oleole.pl/search.bhtml?keyword=outlet";
 
     console.log("Attempting to fetch data from OleOle.pl...");
 
@@ -80,17 +79,65 @@ export const fetchProducts = async (): Promise<Product[]> => {
 
       // If local proxy fails, try public CORS proxies
       console.log("Trying public CORS proxies...");
-      const html = await fetchWithCorsProxy(url);
+
+      // Initialize products array
+      let allProducts: Product[] = [];
+      let currentUrl = url;
+      let pageCount = 1;
+
+      // Fetch first page
+      const html = await fetchWithCorsProxy(currentUrl);
 
       // Parse the HTML content
-      const products = parseHtmlContent(html);
+      const parser = new DOMParser();
+      let doc = parser.parseFromString(html, "text/html");
 
-      if (products.length > 0) {
+      // Get products from first page
+      const products = parseHtmlContent(html);
+      allProducts = [...products];
+
+      console.log(`Parsed ${products.length} products from page 1`);
+
+      // Check if there are more pages and fetch them
+      while (pageCount < 5) {
+        // Limit to 5 pages to avoid too many requests
+        const nextPageUrl = getNextPageUrl(doc, currentUrl);
+        if (!nextPageUrl) {
+          console.log(`No more pages found after page ${pageCount}`);
+          break;
+        }
+
+        console.log(`Fetching page ${pageCount + 1}: ${nextPageUrl}`);
+        try {
+          const nextPageHtml = await fetchWithCorsProxy(nextPageUrl);
+          const nextPageProducts = parseHtmlContent(nextPageHtml);
+
+          console.log(
+            `Parsed ${nextPageProducts.length} products from page ${pageCount + 1}`,
+          );
+
+          // Add products from next page
+          allProducts = [...allProducts, ...nextPageProducts];
+
+          // Update current URL for next iteration
+          currentUrl = nextPageUrl;
+          pageCount++;
+
+          // Update document for next page check
+          doc = parser.parseFromString(nextPageHtml, "text/html");
+        } catch (pageError) {
+          console.error(`Error fetching page ${pageCount + 1}:`, pageError);
+          break;
+        }
+      }
+
+      if (allProducts.length > 0) {
         console.log(
           "Successfully parsed products from HTML via CORS proxy:",
-          products.length,
+          allProducts.length,
+          `from ${pageCount} pages`,
         );
-        return products;
+        return allProducts;
       } else {
         console.warn("Could not parse products from HTML, using mock data");
         return getPhoneAndGPSProducts();
@@ -106,52 +153,150 @@ export const fetchProducts = async (): Promise<Product[]> => {
   }
 };
 
+// Function to check if there are more pages
+const hasNextPage = (doc: Document): boolean => {
+  const paginationLinks = doc.querySelectorAll(".pagination-item");
+  for (const link of paginationLinks) {
+    if (link.textContent?.includes("Następna")) {
+      return true;
+    }
+  }
+  return false;
+};
+
+// Function to get the next page URL
+const getNextPageUrl = (doc: Document, baseUrl: string): string | null => {
+  const paginationLinks = doc.querySelectorAll(".pagination-item");
+  for (const link of paginationLinks) {
+    if (link.textContent?.includes("Następna")) {
+      const href = link.getAttribute("href");
+      if (href) {
+        // If it's a relative URL, make it absolute
+        if (href.startsWith("/")) {
+          return `https://www.oleole.pl${href}`;
+        }
+        return href;
+      }
+    }
+  }
+  return null;
+};
+
 // Function to parse HTML content and extract product information
 const parseHtmlContent = (html: string): Product[] => {
   try {
     const products: Product[] = [];
 
+    // Log the first 200 characters of HTML to debug
+    console.log("HTML preview:", html.substring(0, 200));
+
+    // Check if we received actual HTML content
+    if (!html || html.trim().length === 0 || !html.includes("<html")) {
+      console.warn("Received empty or invalid HTML");
+      return [];
+    }
+
     // Create a temporary DOM element to parse the HTML
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, "text/html");
 
-    // Find product elements
-    const productElements = doc.querySelectorAll(".product-medium-box");
+    // Find product elements - try different selectors that might be on the page
+    let productElements = doc.querySelectorAll(".product-medium-box");
+
+    // If no elements found with the first selector, try alternative selectors
+    if (productElements.length === 0) {
+      productElements = doc.querySelectorAll(".product-box");
+    }
 
     if (productElements.length === 0) {
-      console.warn("No product elements found in HTML");
+      productElements = doc.querySelectorAll(".product-item");
+    }
+
+    if (productElements.length === 0) {
+      console.warn("No product elements found in HTML using any selector");
+      // Log some of the document structure to debug
+      console.log(
+        "Document body preview:",
+        doc.body.innerHTML.substring(0, 500),
+      );
       return [];
     }
+
+    console.log(`Found ${productElements.length} product elements in HTML`);
 
     // Extract product information from each element
     productElements.forEach((element, index) => {
       try {
-        // Extract product name
-        const nameElement = element.querySelector(
+        // Extract product name - try different possible selectors
+        let nameElement = element.querySelector(
           ".product-medium-box-intro__title",
         );
+        if (!nameElement) {
+          nameElement = element.querySelector(".product-name");
+        }
+        if (!nameElement) {
+          nameElement =
+            element.querySelector("h3") || element.querySelector("h4");
+        }
+
         const name = nameElement
           ? nameElement.textContent.trim()
           : `Unknown Product ${index + 1}`;
 
-        // Extract outlet price
-        const priceElement = element.querySelector(".parted-price-total");
+        // Extract outlet price - try different possible selectors
+        let priceElement = element.querySelector(".parted-price-total");
+        if (!priceElement) {
+          priceElement =
+            element.querySelector(".price") ||
+            element.querySelector(".product-price") ||
+            element.querySelector(".current-price");
+        }
+
         let discountedPrice = 0;
         if (priceElement) {
           const priceText = priceElement.textContent.trim();
-          discountedPrice = parseFloat(priceText.replace(/[^0-9]/g, "")) || 0;
+          // Extract numbers from the price text
+          const priceMatch = priceText.match(/[\d\s,.]+/);
+          if (priceMatch) {
+            // Convert "1 234,56" format to 1234.56
+            const normalizedPrice = priceMatch[0]
+              .replace(/\s/g, "")
+              .replace(",", ".");
+            discountedPrice = parseFloat(normalizedPrice) || 0;
+          }
         }
 
-        // Extract original price
-        const originalPriceElement = element.querySelector(
+        // Extract original price - try different possible selectors
+        let originalPriceElement = element.querySelector(
           ".product-medium-box-purchase__new-product-text",
         );
+        if (!originalPriceElement) {
+          originalPriceElement =
+            element.querySelector(".old-price") ||
+            element.querySelector(".regular-price") ||
+            element.querySelector(".original-price");
+        }
+
         let originalPrice = 0;
         if (originalPriceElement) {
           const priceText = originalPriceElement.textContent
-            .replace("Nowy produkt: ", "")
+            .replace(/Nowy produkt:|Cena regularna:|Było:/i, "")
             .trim();
-          originalPrice = parseFloat(priceText.replace(/[^0-9]/g, "")) || 0;
+
+          // Extract numbers from the price text
+          const priceMatch = priceText.match(/[\d\s,.]+/);
+          if (priceMatch) {
+            // Convert "1 234,56" format to 1234.56
+            const normalizedPrice = priceMatch[0]
+              .replace(/\s/g, "")
+              .replace(",", ".");
+            originalPrice = parseFloat(normalizedPrice) || 0;
+          }
+        }
+
+        // If original price is not found or is less than discounted price, estimate it
+        if (originalPrice <= discountedPrice) {
+          originalPrice = discountedPrice * 1.3; // Estimate 30% higher than discounted
         }
 
         // Calculate savings percentage
@@ -160,17 +305,29 @@ const parseHtmlContent = (html: string): Product[] => {
           discountedPrice,
         );
 
-        // Extract image URL
-        const imgElement = element.querySelector("img");
-        const image = imgElement
-          ? imgElement.getAttribute("src")
-          : "https://images.unsplash.com/photo-1585060544812-6b45742d762f?w=200&q=80";
+        // Extract image URL - try different possible selectors
+        let imgElement = element.querySelector("img");
+        if (!imgElement) {
+          imgElement =
+            element.querySelector(".product-image img") ||
+            element.querySelector(".product-img");
+        }
+
+        let image = "";
+        if (imgElement) {
+          // Try different attribute names for the image URL
+          image =
+            imgElement.getAttribute("src") ||
+            imgElement.getAttribute("data-src") ||
+            imgElement.getAttribute("data-lazy-src") ||
+            "";
+        }
 
         // Add product to array
         products.push({
           id: `scraped-${index + 1}`,
           name: name + " (Outlet)",
-          originalPrice: originalPrice || discountedPrice * 1.3, // Fallback if original price not found
+          originalPrice: originalPrice,
           discountedPrice: discountedPrice || 0,
           savingsPercentage: savingsPercentage,
           image:
