@@ -1,0 +1,7 @@
+# netlify.toml
+[[redirects]]
+  from = "/api/*"
+  to = "https://www.oleole.pl/:splat"
+  status = 200
+  force = true
+  headers = {X-From = "Netlify"}
